@@ -188,7 +188,7 @@ def get_room_summary():
         cursor.execute("SELECT eggs_count, fertile_count, expected_hatch FROM clutches WHERE cage_number = ? ORDER BY id DESC LIMIT 1", (c_num,))
         clutch = cursor.fetchone()
         if clutch:
-            report += f"   🐣 *بطن قائم:* {clutch[0]} بيضات (مخصب: {clutch[1]}) |فقس متوقع: {clutch[2] or 'غير محدد'}\n"
+            report += f"   🐣 *بطن قائم:* {clutch[0]} بيضات (مخصب: {clutch[1]}) | فقس متوقع: {clutch[2] or 'غير محدد'}\n"
             
         report += "---------------------\n"
 
@@ -247,5 +247,6 @@ if __name__ == '__main__':
     app_tg = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app_tg.add_handler(CommandHandler("start", start_command))
     app_tg.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    
     print("البوت يعمل بنجاح...")
-    app_tg.run_polling(drop_pending_updates=True)
+    app_tg.run_polling()
