@@ -1,6 +1,8 @@
 import os
 import sqlite3
 import logging
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 from google import genai
@@ -13,11 +15,23 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 
-# 1. إعداد قاعدة البيانات الموسعة
+# --- خادم صغير لفتح البورت وإبقاء Render سعيداً (Free Web Service) ---
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.send_header("Content-type", "text/plain")
+        self.end_headers()
+        self.wfile.write(b"Bot is running!")
+
+def run_health_check_server():
+    port = int(os.environ.get("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
+    server.serve_forever()
+
+# --- 1. إنشاء قاعدة البيانات والجداول ---
 def init_db():
     conn = sqlite3.connect("birds_room.db")
     cursor = conn.cursor()
-    # جدول الأقفاص
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS cages (
             cage_number INTEGER PRIMARY KEY,
@@ -27,7 +41,6 @@ def init_db():
             notes TEXT
         )
     ''')
-    # جدول البطون والبيض
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS clutches (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -39,7 +52,6 @@ def init_db():
             notes TEXT
         )
     ''')
-    # جدول النظامات والوجبات
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS nutrition (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -53,9 +65,8 @@ def init_db():
 
 init_db()
 
-# 2. أدوات التعامل مع قاعدة البيانات
+# --- 2. أدوات قاعدة البيانات ---
 def save_cage(cage_number: int, male_id: str = "", female_id: str = "", strain: str = "", notes: str = ""):
-    """حفظ أو تحديث بيانات قفص (الرقم، الذكر، الأنثى، السلالة مثل موزاييك/أجات، وملاحظات)."""
     conn = sqlite3.connect("birds_room.db")
     cursor = conn.cursor()
     cursor.execute('''
@@ -66,25 +77,23 @@ def save_cage(cage_number: int, male_id: str = "", female_id: str = "", strain: 
             female_id=COALESCE(NULLIF(excluded.female_id, ''), female_id),
             strain=COALESCE(NULLIF(excluded.strain, ''), strain),
             notes=COALESCE(NULLIF(excluded.notes, ''), notes)
-    ''', (cage_number, male_id, female_id, strain, notes))
+    ''', (cage_number, str(male_id), str(female_id), str(strain), str(notes)))
     conn.commit()
     conn.close()
     return f"تم تسجيل/تحديث بيانات القفص رقم {cage_number} بنجاح."
 
 def log_clutch(cage_number: int, eggs_count: int = 0, fertile_count: int = 0, lay_date: str = "", notes: str = ""):
-    """تسجيل بطن بيض جديد لقفص معين (عدد البيض، المخصب، تاريخ البيض)."""
     conn = sqlite3.connect("birds_room.db")
     cursor = conn.cursor()
     cursor.execute('''
         INSERT INTO clutches (cage_number, eggs_count, fertile_count, lay_date, notes)
         VALUES (?, ?, ?, ?, ?)
-    ''', (cage_number, eggs_count, fertile_count, lay_date, notes))
+    ''', (cage_number, eggs_count, fertile_count, str(lay_date), str(notes)))
     conn.commit()
     conn.close()
     return f"تم تسجيل بطن البيض للقفص رقم {cage_number} بنجاح."
 
 def get_room_summary():
-    """استرجاع تقرير شامل عن كافة الأقفاص والبطون المسجلة في غرفة الطيور."""
     conn = sqlite3.connect("birds_room.db")
     cursor = conn.cursor()
     cursor.execute("SELECT cage_number, male_id, female_id, strain, notes FROM cages")
@@ -111,7 +120,7 @@ def get_room_summary():
     conn.close()
     return report
 
-# 3. إدارة جلسات الحوار والذاكرة (Chat History)
+# --- 3. ذاكرة الجلسات وشخصية الخبير ---
 user_chats = {}
 
 SYSTEM_INSTRUCTION = """
@@ -121,18 +130,14 @@ SYSTEM_INSTRUCTION = """
 مهامك:
 1. فهم كلام المربي وتحليله بدقة.
 2. استخدام الأدوات المتاحة لترسيخ وحفظ البيانات (أقفاص، طفرات، بطون بيض، تواريخ) أو استرجاع التقرير الشامل.
-3. الإجابة عن الاستفسارات وتوفير النصائح التخصصية في التغذية (مثل الخلطات والباتيه والمكملات كـ Ferti-Vit و AD3E) والتربية بأسلوب مرن وطبيعي جداً بدون رسميات جافة.
+3. الإجابة عن الاستفسارات وتوفير النصائح التخصصية في التغذية والتربية بأسلوب مرن وطبيعي جداً.
 """
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     welcome_text = (
         "يا مرحباً بك في نظام إدارة غرفة الطيور المطور! 🐦✨\n\n"
         "أنا جاهز لمساعدتك وتسجيل كل تفاصيل الأقفاص، الطفرات، البيض، والبرامج الغذائية.\n"
-        "تحدث معي بشكل طبيعي كأنك تسولف مع خبير في غرفتك، مثلاً:\n"
-        "• 'سجل قفص 1 فيه ذكر موزاييك أجات وأنثى موزاييك أحمر'\n"
-        "• 'قفص 1 باضوا اليوم 4 بيضات'\n"
-        "• 'اعرض لي التقرير الشامل للغرفة'\n"
-        "• 'شو الأغذية المناسبة في مرحلة تجهيز الأزواج؟'"
+        "تحدث معي بشكل طبيعي كأنك تسولف مع خبير في غرفتك."
     )
     await update.message.reply_text(welcome_text)
 
@@ -140,7 +145,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_text = update.message.text
 
-    # إنشاء جلسة شات للذاكرة لكل مستخدم
     if user_id not in user_chats:
         user_chats[user_id] = client.chats.create(
             model='gemini-2.5-flash',
@@ -170,7 +174,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 else:
                     res = "أداة غير معروفة."
 
-                # إرجاع نتيجة الأداة للنموذج للاستمرار في المحادثة
                 second_response = chat.send_message(
                     types.Part.from_function_response(name=name, response={"result": res})
                 )
@@ -185,6 +188,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("حصل خطأ بسيط في معالجة الرسالة، جرب مرة ثانية.")
 
 if __name__ == '__main__':
+    # تشغيل خادم السيرفر في خلفية الخيط (Thread)
+    t = threading.Thread(target=run_health_check_server, daemon=True)
+    t.start()
+
+    # تشغيل بوت التلغرام
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
