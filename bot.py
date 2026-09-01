@@ -232,12 +232,13 @@ def get_upcoming_events(days_ahead: int = 7) -> str:
 # تهيئة نموذج Gemini
 # --------------------------
 SYSTEM_PROMPT = """
-أنت خبير ومستشار محترف في تربية الكناري وطفراته (مثل الموزاييك، الأجات، والتوباز)، وعلم الجينات، والحضانة، والتغذية، والعلاج.
-تتحدث بأسلوب ودود وخبير، وتستخدم الأدوات المتاحة تلقائياً لتسجيل واسترجاع بيانات غرفة الإنتاج في قاعدة البيانات.
+أنت خبير ومستشار محترف في تربية الكناري وطفراته (مثل الموزاييك، الأجات، والتوباز)، وعلم الجينات، والحضانة، و�[...]
+تتحدث بأسلوب ودود وخبير، وتستخدم الأدوات المتاحة تلقائياً لتسجيل واسترجاع بيانات غرفة الإنتاج في قاعدة البي�[...]
 """
 
+# تم تحديث اسم النموذج إلى gemini-3.6-flash (النموذج الأحدث)
 model = genai.GenerativeModel(
-    model_name='gemini-2.0-flash',
+    model_name='models/gemini-3.6-flash',
     system_instruction=SYSTEM_PROMPT,
     tools=[save_cage, add_bird, log_clutch, log_health, get_room_summary, get_upcoming_events]
 )
@@ -246,7 +247,7 @@ model = genai.GenerativeModel(
 # معالجات تلغرام
 # --------------------------
 async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("مرحباً بك في Canary Assistant Bot! 🐦✨\nأنا جاهز لمساعدتك في إدارة الأقفاص، الحجل، السلالات، ومواعيد الفقس.")
+    await update.message.reply_text("مرحباً بك في Canary Assistant Bot! 🐦✨\nأنا جاهز لمساعدتك في إدارة الأقفاص، الحجل، السلالات، ومواع�[...")
 
 async def report_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(get_room_summary())
@@ -265,15 +266,28 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         response = await asyncio.to_thread(chat.send_message, user_text)
-        if response.text:
+        if getattr(response, "text", None):
             await update.message.reply_text(response.text)
         else:
-            await update.message.reply_text("تم تنفيذ الطلب بنجاح.")
+            # بعض إصدارات المكتبة قد ترجع المخرجات في مواقع مختلفة
+            output_text = None
+            if hasattr(response, "output_text"):
+                output_text = response.output_text
+            else:
+                try:
+                    output_text = response.output[0].content[0].text
+                except Exception:
+                    output_text = None
+
+            if output_text:
+                await update.message.reply_text(output_text)
+            else:
+                await update.message.reply_text("تم تنفيذ الطلب بنجاح.")
     except Exception as e:
         user_sessions[user_id] = model.start_chat(enable_automatic_function_calling=True)
         try:
             response = await asyncio.to_thread(user_sessions[user_id].send_message, user_text)
-            await update.message.reply_text(response.text)
+            await update.message.reply_text(getattr(response, "text", str(response)))
         except Exception as err:
             await update.message.reply_text(f"⚠️ حدث خطأ أثناء المعالجة: {str(err)}")
 
