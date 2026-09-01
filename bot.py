@@ -3,7 +3,7 @@ import sqlite3
 import threading
 import asyncio
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Optional, List, Dict
 
 from flask import Flask
 from telegram import Update
@@ -30,10 +30,11 @@ if not TELEGRAM_BOT_TOKEN:
 if not GEMINI_API_KEY:
     raise RuntimeError("يرجى تعيين متغير البيئة GEMINI_API_KEY")
 
+# Configure the google generative AI client
 genai.configure(api_key=GEMINI_API_KEY)
 
-# جلسات محادثة Gemini للحيادية واستمرار السياق
-user_sessions = {}
+# جلسات محادثة (نحتفظ بسجل مبسط من الرسائل لكل مستخدم)
+user_sessions: Dict[int, List[Dict[str, str]]] = {}
 DB_LOCK = threading.Lock()
 
 # --------------------------
@@ -93,6 +94,7 @@ def init_db() -> None:
         conn.commit()
         conn.close()
 
+
 def db_execute(query: str, params: tuple = (), fetch: bool = False):
     with DB_LOCK:
         conn = sqlite3.connect(DB_PATH, check_same_thread=False)
@@ -107,7 +109,6 @@ def db_execute(query: str, params: tuple = (), fetch: bool = False):
 # أدوات (Tools) التحكم بقاعدة البيانات
 # --------------------------
 def save_cage(cage_id: str, location: str = "", notes: str = "") -> str:
-    """تسجيل أو تحديث بيانات قفص في قاعدة البيانات."""
     db_execute(
         """
         INSERT INTO cages (cage_id, location, notes)
@@ -117,6 +118,7 @@ def save_cage(cage_id: str, location: str = "", notes: str = "") -> str:
         (cage_id, location, notes),
     )
     return f"تم حفظ القفص '{cage_id}' بنجاح. الموقع: '{location}'."
+
 
 def add_bird(
     bird_id: str,
@@ -131,7 +133,6 @@ def add_bird(
     status: str = "نشط",
     notes: str = "",
 ) -> str:
-    """إضافة أو تحديث طائر في سجلات غرفة الإنتاج."""
     db_execute(
         """
         INSERT INTO birds (bird_id, ring_number, gender, breed, mutation, birth_date, father_id, mother_id, cage_id, status, notes)
@@ -152,6 +153,7 @@ def add_bird(
     )
     return f"تم إضافة/تحديث الطائر '{bird_id}' بنجاح (القفص: '{cage_id}')."
 
+
 def log_clutch(
     cage_id: str,
     male_id: str = "",
@@ -164,7 +166,6 @@ def log_clutch(
     hatched_count: int = 0,
     notes: str = "",
 ) -> str:
-    """تسجيل بطنة بيض جديدة واحتساب تاريخ الفقس المتوقع بناءً على بداية الحضانة."""
     expected_db = ""
     if incubation_start_date:
         try:
@@ -182,8 +183,8 @@ def log_clutch(
     )
     return f"تم تسجيل البطنة للقفص '{cage_id}'. الفقس المتوقع: '{expected_db or 'غير محدد'}'."
 
+
 def log_health(bird_id: str, issue: str, treatment: str = "", notes: str = "") -> str:
-    """تسجيل حالة صحية أو علاج لطائر معين."""
     today = datetime.now().strftime("%Y-%m-%d")
     db_execute(
         """
@@ -194,8 +195,8 @@ def log_health(bird_id: str, issue: str, treatment: str = "", notes: str = "") -
     )
     return f"تم تسجيل حالة صحية للطائر '{bird_id}' بتاريخ {today}."
 
+
 def get_room_summary() -> str:
-    """جلب تقرير ملخص شامل عن غرفة الطيور والإنتاج."""
     cages = db_execute("SELECT COUNT(*) FROM cages", fetch=True)[0][0]
     birds = db_execute("SELECT COUNT(*) FROM birds", fetch=True)[0][0]
     clutches_active = db_execute("SELECT COUNT(*) FROM clutches WHERE expected_hatch_date IS NOT NULL AND (hatched_count IS NULL OR hatched_count < egg_count)", fetch=True)[0][0]
@@ -209,8 +210,8 @@ def get_room_summary() -> str:
         f"- إجمالي السجلات الصحية: {health_total}\n"
     )
 
+
 def get_upcoming_events(days_ahead: int = 7) -> str:
-    """عرض البطنات المتوقع فقسها خلال الأيام المقبلة."""
     today = datetime.now().date()
     end = today + timedelta(days=days_ahead)
     rows = db_execute("SELECT clutch_id, cage_id, egg_count, expected_hatch_date FROM clutches WHERE expected_hatch_date IS NOT NULL", fetch=True)
@@ -229,25 +230,35 @@ def get_upcoming_events(days_ahead: int = 7) -> str:
     return f"🐣 **الأحداث القادمة خلال {days_ahead} أيام:**\n" + "\n".join(upcoming)
 
 # --------------------------
-# تهيئة نموذج Gemini
+# تهيئة نموذج Gemini (باستخدام واجهة generate_content)
 # --------------------------
 SYSTEM_PROMPT = """
-أنت خبير ومستشار محترف في تربية الكناري وطفراته (مثل الموزاييك، الأجات، والتوباز)، وعلم الجينات، والحضانة، و�[...]
-تتحدث بأسلوب ودود وخبير، وتستخدم الأدوات المتاحة تلقائياً لتسجيل واسترجاع بيانات غرفة الإنتاج في قاعدة البي�[...]
+أنت خبير ومستشار محترف في تربية الكناري وطفراته (مثل الموزاييك، الأجات، والتوباز)، وعلم الجينات، والحضانة، وعمليات التربية وإدارة الأقفاص.
+تتحدث بأسلوب ودود وخبير، وتستخدم الأدوات المتاحة تلقائياً لتسجيل واسترجاع بيانات غرفة الإنتاج في قاعدة البيانات عندما يطلب المستخدم ذلك صراحةً.
 """
 
-# تم تحديث اسم النموذج إلى gemini-3.6-flash (النموذج الأحدث)
-model = genai.GenerativeModel(
-    model_name='models/gemini-3.6-flash',
-    system_instruction=SYSTEM_PROMPT,
-    tools=[save_cage, add_bird, log_clutch, log_health, get_room_summary, get_upcoming_events]
-)
+# استخدم النموذج الأحدث
+model = genai.GenerativeModel("models/gemini-3.6-flash")
+
+# Helper: تحويل سجل المحادثة إلى صيغة يقبلها SDK
+def build_genai_messages(history: List[Dict[str, str]]) -> List[Dict[str, List[str]]]:
+    msgs = []
+    for m in history:
+        role = m.get("role")
+        text = m.get("text", "")
+        if role == "system":
+            msgs.append({"role": "system", "parts": [text]})
+        elif role == "user":
+            msgs.append({"role": "user", "parts": [text]})
+        elif role == "assistant":
+            msgs.append({"role": "assistant", "parts": [text]})
+    return msgs
 
 # --------------------------
 # معالجات تلغرام
 # --------------------------
 async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("مرحباً بك في Canary Assistant Bot! 🐦✨\nأنا جاهز لمساعدتك في إدارة الأقفاص، الحجل، السلالات، ومواع�[...")
+    await update.message.reply_text("مرحباً بك في Canary Assistant Bot! 🐦✨\nأنا جاهز لمساعدتك في إدارة الأقفاص، الطيور، والسجلات. جرّب الأوامر: /report أو /upcoming أو أرسل سؤالاً طبيعياً.")
 
 async def report_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(get_room_summary())
@@ -259,37 +270,43 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_text = update.message.text or ""
 
+    # تأكد من وجود سجل محادثة للمستخدم (نضع system prompt أولاً)
     if user_id not in user_sessions:
-        user_sessions[user_id] = model.start_chat(enable_automatic_function_calling=True)
+        user_sessions[user_id] = [{"role": "system", "text": SYSTEM_PROMPT}]
 
-    chat = user_sessions[user_id]
+    history = user_sessions[user_id]
+    history.append({"role": "user", "text": user_text})
+
+    # حدّ من طول السجل (حافظ على الرسالة النظامية + آخر 20 رسالة)
+    if len(history) > 22:
+        history = [history[0]] + history[-21:]
+        user_sessions[user_id] = history
 
     try:
-        response = await asyncio.to_thread(chat.send_message, user_text)
-        if getattr(response, "text", None):
-            await update.message.reply_text(response.text)
-        else:
-            # بعض إصدارات المكتبة قد ترجع المخرجات في مواقع مختلفة
-            output_text = None
-            if hasattr(response, "output_text"):
-                output_text = response.output_text
-            else:
-                try:
-                    output_text = response.output[0].content[0].text
-                except Exception:
-                    output_text = None
+        messages = build_genai_messages(history)
+        # استدعاء نموذج Gemini للحصول على الرد
+        response = await asyncio.to_thread(model.generate_content, messages)
 
-            if output_text:
-                await update.message.reply_text(output_text)
-            else:
-                await update.message.reply_text("تم تنفيذ الطلب بنجاح.")
+        # استخراج النص من الاستجابة (عدة طرق بحسب إصدار المكتبة)
+        reply_text = getattr(response, "text", None)
+        if not reply_text:
+            try:
+                reply_text = response.output[0].content[0].text
+            except Exception:
+                reply_text = None
+
+        if reply_text:
+            history.append({"role": "assistant", "text": reply_text})
+            # تحديث السجل المختصر
+            if len(history) > 22:
+                history = [history[0]] + history[-21:]
+                user_sessions[user_id] = history
+
+            await update.message.reply_text(reply_text)
+        else:
+            await update.message.reply_text("تم تنفيذ الطلب بنجاح.")
     except Exception as e:
-        user_sessions[user_id] = model.start_chat(enable_automatic_function_calling=True)
-        try:
-            response = await asyncio.to_thread(user_sessions[user_id].send_message, user_text)
-            await update.message.reply_text(getattr(response, "text", str(response)))
-        except Exception as err:
-            await update.message.reply_text(f"⚠️ حدث خطأ أثناء المعالجة: {str(err)}")
+        await update.message.reply_text(f"⚠️ حدث خطأ أثناء المعالجة: {str(e)}")
 
 # --------------------------
 # Flask Web Server (Render Health Check)
@@ -299,6 +316,7 @@ app = Flask(__name__)
 @app.route("/", methods=["GET"])
 def index():
     return "Canary Assistant Bot is Active!", 200
+
 
 def run_flask():
     app.run(host="0.0.0.0", port=PORT)
