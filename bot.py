@@ -122,7 +122,7 @@ SYSTEM_INSTRUCTION = """
 """
 
 model = genai.GenerativeModel(
-    model_name='gemini-1.5-flash-latest',
+    model_name='gemini-1.5-pro',
     system_instruction=SYSTEM_INSTRUCTION,
     tools=[save_cage, log_clutch, get_room_summary]
 )
