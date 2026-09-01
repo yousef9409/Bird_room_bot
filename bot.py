@@ -2,32 +2,32 @@ import os
 import sqlite3
 import logging
 import threading
+import asyncio
 from flask import Flask
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
-from google import genai
-from google.genai import types
+import google.generativeai as genai
 
 logging.basicConfig(level=logging.INFO)
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
 
+# إعداد مكتبة Gemini
+genai.configure(api_key=GEMINI_API_KEY)
 
-client = genai.Client(api_key=GEMINI_API_KEY)
-
-# --- 1. خادم Flask خفيف جداً لإبقاء Render سعيداً وتجنب خطأ 502 ---
+# --- 1. خادم Flask الخفيف لبيئة Render ---
 app_flask = Flask(__name__)
 
 @app_flask.route('/')
 def home():
-    return "Bot is running perfectly!", 200
+    return "Bird Room Bot is Active!", 200
 
 def run_flask():
     port = int(os.environ.get("PORT", 10000))
     app_flask.run(host="0.0.0.0", port=port)
 
-# --- 2. إنشاء قاعدة البيانات للجداول ---
+# --- 2. إدارة قاعدة البيانات SQLite ---
 def init_db():
     conn = sqlite3.connect("birds_room.db")
     cursor = conn.cursor()
@@ -55,8 +55,9 @@ def init_db():
 
 init_db()
 
-# --- 3. أدوات قاعدة البيانات ---
+# --- 3. أدوات التحكم بالقاعدة ---
 def save_cage(cage_number: int, male_id: str = "", female_id: str = "", strain: str = "", notes: str = ""):
+    """تسجيل أو تحديث البيانات الخاصة بقفص مع معين (رقم القفص، الذكر، الأنثى، الطفرة/السلالة، ملاحظات)."""
     conn = sqlite3.connect("birds_room.db")
     cursor = conn.cursor()
     cursor.execute('''
@@ -70,9 +71,10 @@ def save_cage(cage_number: int, male_id: str = "", female_id: str = "", strain: 
     ''', (cage_number, str(male_id), str(female_id), str(strain), str(notes)))
     conn.commit()
     conn.close()
-    return f"تم تسجيل/تحديث بيانات القفص رقم {cage_number} بنجاح."
+    return f"تم تسجيل البيانات للقفص رقم {cage_number} بنجاح في قاعدة البيانات."
 
 def log_clutch(cage_number: int, eggs_count: int = 0, fertile_count: int = 0, lay_date: str = "", notes: str = ""):
+    """تسجيل بطن بيض جديد لقفص معين (عدد البيض، البيض المخصب، تاريخ البياض، ملاحظات)."""
     conn = sqlite3.connect("birds_room.db")
     cursor = conn.cursor()
     cursor.execute('''
@@ -84,6 +86,7 @@ def log_clutch(cage_number: int, eggs_count: int = 0, fertile_count: int = 0, la
     return f"تم تسجيل بطن البيض للقفص رقم {cage_number} بنجاح."
 
 def get_room_summary():
+    """استرجاع تقرير شامل لجميع الأقفاص والمحتويات وبطون البيض في غرفة الطيور."""
     conn = sqlite3.connect("birds_room.db")
     cursor = conn.cursor()
     cursor.execute("SELECT cage_number, male_id, female_id, strain, notes FROM cages")
@@ -110,18 +113,22 @@ def get_room_summary():
     conn.close()
     return report
 
-# --- 4. ذاكرة الجلسات وشخصية الخبير ---
-user_chats = {}
-
+# --- 4. إعداد النموذج والشخصية ---
 SYSTEM_INSTRUCTION = """
-أنت خبير ومساعد محترف في إدارة غرفة الطيور (خاصة الكناري والسلالات المختلفة مثل الموزاييك والأجات والتوباز والجينات والتغذية).
+أنت خبير ومساعد محترف في إدارة غرفة الطيور (خاصة الكناري والسلالات المختلفة مثل الموزاييك والأجات والتوباز وأوبال والجينات والتغذية).
 تتحدث بمرونة، ذكاء، وود كأنك زميل خبير ومساعد شخصي للمربي.
 
-مهامك:
-1. فهم كلام المربي وتحليله بدقة.
-2. استخدام الأدوات المتاحة لترسيخ وحفظ البيانات (أقفاص، طفرات، بطون بيض، تواريخ) أو استرجاع التقرير الشامل.
-3. الإجابة عن الاستفسارات وتوفير النصائح التخصصية في التغذية والتربية بأسلوب مرن وطبيعي جداً.
+عندما ينطلب منك حفظ أو تسجيل أي قفص، طفرة، بيض، أو عرض التقرير، استخدم الدوال (Tools) المتاحة لك فوراً.
 """
+
+model = genai.GenerativeModel(
+    model_name='gemini-1.5-flash',
+    system_instruction=SYSTEM_INSTRUCTION,
+    tools=[save_cage, log_clutch, get_room_summary]
+)
+
+# حفظ جلسات الشات بشكل آمن
+user_sessions = {}
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     welcome_text = (
@@ -135,56 +142,36 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_text = update.message.text
 
-    if user_id not in user_chats:
-        user_chats[user_id] = client.chats.create(
-            model='gemini-2.5-flash',
-            config=types.GenerateContentConfig(
-                system_instruction=SYSTEM_INSTRUCTION,
-                tools=[save_cage, log_clutch, get_room_summary],
-                temperature=0.4
-            )
-        )
+    if user_id not in user_sessions:
+        user_sessions[user_id] = model.start_chat(enable_automatic_function_calling=True)
     
-    chat = user_chats[user_id]
+    chat = user_sessions[user_id]
 
     try:
-        response = chat.send_message(user_text)
-
-        if response.function_calls:
-            for call in response.function_calls:
-                name = call.name
-                args = call.args
-                
-                if name == "save_cage":
-                    res = save_cage(**args)
-                elif name == "log_clutch":
-                    res = log_clutch(**args)
-                elif name == "get_room_summary":
-                    res = get_room_summary()
-                else:
-                    res = "أداة غير معروفة."
-
-                second_response = chat.send_message(
-                    types.Part.from_function_response(name=name, response={"result": res})
-                )
-                await update.message.reply_text(second_response.text)
-                return
-
+        # تشغيل طلب Gemini داخل Thread منفصل لمنع تجميد تلغرام
+        response = await asyncio.to_thread(chat.send_message, user_text)
+        
         if response.text:
             await update.message.reply_text(response.text)
+        else:
+            await update.message.reply_text("تم حفظ البيانات بنجاح في النظام.")
 
     except Exception as e:
-        logging.error(f"Error: {e}")
-        await update.message.reply_text("حصل خطأ بسيط في معالجة الرسالة، جرب مرة ثانية.")
+        logging.error(f"Error handling message: {e}")
+        # إعادة فتح الجلسة تلقائياً في حال انتهت
+        user_sessions[user_id] = model.start_chat(enable_automatic_function_calling=True)
+        try:
+            response = await asyncio.to_thread(user_sessions[user_id].send_message, user_text)
+            await update.message.reply_text(response.text)
+        except Exception as err:
+            await update.message.reply_text(f"⚠️ حدث خطأ في النظام: {str(err)}")
 
 if __name__ == '__main__':
-    # تشغيل سيرفر Flask في خيط منفصل لتفادي 502 Bad Gateway
     t = threading.Thread(target=run_flask, daemon=True)
     t.start()
 
-    # تشغيل بوت التلغرام
     app_tg = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app_tg.add_handler(CommandHandler("start", start_command))
     app_tg.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    print("البوت المطور يعمل الآن...")
+    print("البوت يعمل الآن بصورة مستقرة...")
     app_tg.run_polling(drop_pending_updates=True)
