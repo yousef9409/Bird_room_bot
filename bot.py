@@ -122,11 +122,10 @@ SYSTEM_INSTRUCTION = """
 """
 
 model = genai.GenerativeModel(
-    model_name='gemini-1.5',
+    model_name='gemini-2.5-flash',          # ← غيّر هنا
     system_instruction=SYSTEM_INSTRUCTION,
     tools=[save_cage, log_clutch, get_room_summary]
 )
-
 
 # حفظ جلسات الشات بشكل آمن
 user_sessions = {}
