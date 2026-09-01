@@ -2,7 +2,7 @@ import os
 import sqlite3
 import logging
 import threading
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from flask import Flask
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
 from google import genai
@@ -10,25 +10,23 @@ from google.genai import types
 
 logging.basicConfig(level=logging.INFO)
 
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+TELEGRAM_TOKEN = os.environ.get("8989199204:AAEWEKhYtC1bFsYA4HzYphDAKzw-peAz4yc")
+GEMINI_API_KEY = os.environ.get("AQ.Ab8RN6IUsMK0HnfVelcULyvprjQLdo57f7VcFmnEB8vv_jV0fA")
 
 client = genai.Client(api_key=GEMINI_API_KEY)
 
-# --- خادم صغير لفتح البورت وإبقاء Render سعيداً (Free Web Service) ---
-class HealthCheckHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-type", "text/plain")
-        self.end_headers()
-        self.wfile.write(b"Bot is running!")
+# --- 1. خادم Flask خفيف جداً لإبقاء Render سعيداً وتجنب خطأ 502 ---
+app_flask = Flask(__name__)
 
-def run_health_check_server():
-    port = int(os.environ.get("PORT", 8080))
-    server = HTTPServer(("0.0.0.0", port), HealthCheckHandler)
-    server.serve_forever()
+@app_flask.route('/')
+def home():
+    return "Bot is running perfectly!", 200
 
-# --- 1. إنشاء قاعدة البيانات والجداول ---
+def run_flask():
+    port = int(os.environ.get("PORT", 10000))
+    app_flask.run(host="0.0.0.0", port=port)
+
+# --- 2. إنشاء قاعدة البيانات للجداول ---
 def init_db():
     conn = sqlite3.connect("birds_room.db")
     cursor = conn.cursor()
@@ -48,16 +46,7 @@ def init_db():
             eggs_count INTEGER,
             fertile_count INTEGER,
             lay_date TEXT,
-            hatch_date TEXT,
             notes TEXT
-        )
-    ''')
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS nutrition (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            day_or_stage TEXT,
-            diet_details TEXT,
-            supplements TEXT
         )
     ''')
     conn.commit()
@@ -65,7 +54,7 @@ def init_db():
 
 init_db()
 
-# --- 2. أدوات قاعدة البيانات ---
+# --- 3. أدوات قاعدة البيانات ---
 def save_cage(cage_number: int, male_id: str = "", female_id: str = "", strain: str = "", notes: str = ""):
     conn = sqlite3.connect("birds_room.db")
     cursor = conn.cursor()
@@ -120,7 +109,7 @@ def get_room_summary():
     conn.close()
     return report
 
-# --- 3. ذاكرة الجلسات وشخصية الخبير ---
+# --- 4. ذاكرة الجلسات وشخصية الخبير ---
 user_chats = {}
 
 SYSTEM_INSTRUCTION = """
@@ -188,13 +177,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("حصل خطأ بسيط في معالجة الرسالة، جرب مرة ثانية.")
 
 if __name__ == '__main__':
-    # تشغيل خادم السيرفر في خلفية الخيط (Thread)
-    t = threading.Thread(target=run_health_check_server, daemon=True)
+    # تشغيل سيرفر Flask في خيط منفصل لتفادي 502 Bad Gateway
+    t = threading.Thread(target=run_flask, daemon=True)
     t.start()
 
     # تشغيل بوت التلغرام
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app_tg = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    app_tg.add_handler(CommandHandler("start", start_command))
+    app_tg.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     print("البوت المطور يعمل الآن...")
-    app.run_polling()
+    app_tg.run_polling(drop_pending_updates=True)
