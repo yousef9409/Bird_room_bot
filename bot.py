@@ -242,16 +242,19 @@ model = genai.GenerativeModel("models/gemini-3.6-flash")
 
 # Helper: تحويل سجل المحادثة إلى صيغة يقبلها SDK
 def build_genai_messages(history: List[Dict[str, str]]) -> List[Dict[str, List[str]]]:
+    """
+    The Google Generative AI service expects roles like 'MODEL' and 'USER'.
+    Map our internal roles ('system','assistant','user') to the expected ones.
+    """
     msgs = []
     for m in history:
         role = m.get("role")
         text = m.get("text", "")
-        if role == "system":
-            msgs.append({"role": "system", "parts": [text]})
+        if role in ("system", "assistant"):
+            # The API reports valid roles: MODEL, USER
+            msgs.append({"role": "MODEL", "parts": [text]})
         elif role == "user":
-            msgs.append({"role": "user", "parts": [text]})
-        elif role == "assistant":
-            msgs.append({"role": "assistant", "parts": [text]})
+            msgs.append({"role": "USER", "parts": [text]})
     return msgs
 
 # --------------------------
@@ -277,7 +280,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     history = user_sessions[user_id]
     history.append({"role": "user", "text": user_text})
 
-    # حدّ من طول السجل (حافظ على الرسالة النظامية + آخر 20 رسالة)
+    # حدّ من طول السجل (حاف�� على الرسالة النظامية + آخر 20 رسالة)
     if len(history) > 22:
         history = [history[0]] + history[-21:]
         user_sessions[user_id] = history
