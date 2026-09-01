@@ -1,227 +1,266 @@
 import os
 import sqlite3
-import logging
 import threading
 import asyncio
 from datetime import datetime, timedelta
+from typing import Optional
+
 from flask import Flask
 from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
+
 import google.generativeai as genai
 
-logging.basicConfig(level=logging.INFO)
+# --------------------------
+# إعداد المتغيرات البيئية
+# --------------------------
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+PORT = int(os.environ.get("PORT", "10000"))
+DB_PATH = os.environ.get("CANARY_DB_PATH", "canary_room.db")
 
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+if not TELEGRAM_BOT_TOKEN:
+    raise RuntimeError("يرجى تعيين متغير البيئة TELEGRAM_BOT_TOKEN")
+if not GEMINI_API_KEY:
+    raise RuntimeError("يرجى تعيين متغير البيئة GEMINI_API_KEY")
 
 genai.configure(api_key=GEMINI_API_KEY)
 
-# ------------------- Flask لـ Render -------------------
-app_flask = Flask(__name__)
+# جلسات محادثة Gemini للحيادية واستمرار السياق
+user_sessions = {}
+DB_LOCK = threading.Lock()
 
-@app_flask.route('/')
-def home():
-    return "Bird Room Production Assistant is Active! 🐦", 200
+# --------------------------
+# قاعدة البيانات وإعداد الجداول
+# --------------------------
+def init_db() -> None:
+    with DB_LOCK:
+        conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+        cur = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS cages (
+                cage_id TEXT PRIMARY KEY,
+                location TEXT,
+                notes TEXT
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS birds (
+                bird_id TEXT PRIMARY KEY,
+                ring_number TEXT,
+                gender TEXT,
+                breed TEXT,
+                mutation TEXT,
+                birth_date DATE,
+                father_id TEXT,
+                mother_id TEXT,
+                cage_id TEXT,
+                status TEXT,
+                notes TEXT
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS clutches (
+                clutch_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                cage_id TEXT,
+                male_id TEXT,
+                female_id TEXT,
+                egg_count INTEGER,
+                fertile_count INTEGER,
+                lay_date DATE,
+                incubation_start_date DATE,
+                expected_hatch_date DATE,
+                hatched_count INTEGER,
+                notes TEXT
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS health_records (
+                record_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                bird_id TEXT,
+                record_date DATE,
+                issue TEXT,
+                treatment TEXT,
+                notes TEXT
+            )
+        """)
+        conn.commit()
+        conn.close()
 
-def run_flask():
-    port = int(os.environ.get("PORT", 10000))
-    app_flask.run(host="0.0.0.0", port=port)
+def db_execute(query: str, params: tuple = (), fetch: bool = False):
+    with DB_LOCK:
+        conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+        cur = conn.cursor()
+        cur.execute(query, params)
+        result = cur.fetchall() if fetch else None
+        conn.commit()
+        conn.close()
+        return result
 
-# ------------------- قاعدة البيانات الموسعة -------------------
-def init_db():
-    conn = sqlite3.connect("birds_room.db")
-    cursor = conn.cursor()
-    
-    # الأقفاص
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS cages (
-            cage_number INTEGER PRIMARY KEY,
-            location TEXT,
-            notes TEXT
-        )
-    ''')
-    
-    # الطيور الفردية
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS birds (
-            bird_id TEXT PRIMARY KEY,
-            ring_number TEXT,
-            gender TEXT,
-            strain TEXT,
-            mutation TEXT,
-            birth_date TEXT,
-            father_id TEXT,
-            mother_id TEXT,
-            cage_number INTEGER,
-            status TEXT DEFAULT 'نشط',
-            notes TEXT
-        )
-    ''')
-    
-    # بطون البيض / الحضانة
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS clutches (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            cage_number INTEGER,
-            pair_male TEXT,
-            pair_female TEXT,
-            eggs_count INTEGER,
-            fertile_count INTEGER,
-            lay_date TEXT,
-            incubation_start TEXT,
-            expected_hatch TEXT,
-            hatched_count INTEGER DEFAULT 0,
-            notes TEXT
-        )
-    ''')
-    
-    # السجلات الصحية
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS health_records (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            bird_id TEXT,
-            date TEXT,
-            issue TEXT,
-            treatment TEXT,
-            notes TEXT
-        )
-    ''')
-    conn.commit()
-    conn.close()
-
-init_db()
-
-# ------------------- أدوات قاعدة البيانات (Tools) -------------------
-def save_cage(cage_number: int, location: str = "", notes: str = ""):
-    """تسجيل أو تحديث بيانات قفص."""
-    conn = sqlite3.connect("birds_room.db")
-    cursor = conn.cursor()
-    cursor.execute('''
-        INSERT INTO cages (cage_number, location, notes)
+# --------------------------
+# أدوات (Tools) التحكم بقاعدة البيانات
+# --------------------------
+def save_cage(cage_id: str, location: str = "", notes: str = "") -> str:
+    """تسجيل أو تحديث بيانات قفص في قاعدة البيانات."""
+    db_execute(
+        """
+        INSERT INTO cages (cage_id, location, notes)
         VALUES (?, ?, ?)
-        ON CONFLICT(cage_number) DO UPDATE SET
-            location = COALESCE(NULLIF(excluded.location, ''), location),
-            notes = COALESCE(NULLIF(excluded.notes, ''), notes)
-    ''', (cage_number, location, notes))
-    conn.commit()
-    conn.close()
-    return f"✅ تم حفظ بيانات القفص رقم {cage_number} بنجاح."
+        ON CONFLICT(cage_id) DO UPDATE SET location=excluded.location, notes=excluded.notes
+        """,
+        (cage_id, location, notes),
+    )
+    return f"تم حفظ القفص '{cage_id}' بنجاح. الموقع: '{location}'."
 
-def add_bird(bird_id: str, ring_number: str = "", gender: str = "", strain: str = "", mutation: str = "", birth_date: str = "", father_id: str = "", mother_id: str = "", cage_number: int = 0, notes: str = ""):
-    """إضافة أو تحديث طائر جديد في النظام."""
-    conn = sqlite3.connect("birds_room.db")
-    cursor = conn.cursor()
-    cursor.execute('''
-        INSERT INTO birds (bird_id, ring_number, gender, strain, mutation, birth_date, father_id, mother_id, cage_number, notes)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+def add_bird(
+    bird_id: str,
+    ring_number: str = "",
+    gender: str = "",
+    breed: str = "",
+    mutation: str = "",
+    birth_date: str = "",
+    father_id: str = "",
+    mother_id: str = "",
+    cage_id: str = "",
+    status: str = "نشط",
+    notes: str = "",
+) -> str:
+    """إضافة أو تحديث طائر في سجلات غرفة الإنتاج."""
+    db_execute(
+        """
+        INSERT INTO birds (bird_id, ring_number, gender, breed, mutation, birth_date, father_id, mother_id, cage_id, status, notes)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(bird_id) DO UPDATE SET
-            ring_number = COALESCE(NULLIF(excluded.ring_number, ''), ring_number),
-            gender = COALESCE(NULLIF(excluded.gender, ''), gender),
-            strain = COALESCE(NULLIF(excluded.strain, ''), strain),
-            mutation = COALESCE(NULLIF(excluded.mutation, ''), mutation),
-            birth_date = COALESCE(NULLIF(excluded.birth_date, ''), birth_date),
-            father_id = COALESCE(NULLIF(excluded.father_id, ''), father_id),
-            mother_id = COALESCE(NULLIF(excluded.mother_id, ''), mother_id),
-            cage_number = CASE WHEN excluded.cage_number != 0 THEN excluded.cage_number ELSE cage_number END,
-            notes = COALESCE(NULLIF(excluded.notes, ''), notes)
-    ''', (bird_id, ring_number, gender, strain, mutation, birth_date, father_id, mother_id, cage_number, notes))
-    conn.commit()
-    conn.close()
-    return f"✅ تم تسجيل الطائر {bird_id} بنجاح."
+          ring_number=excluded.ring_number,
+          gender=excluded.gender,
+          breed=excluded.breed,
+          mutation=excluded.mutation,
+          birth_date=excluded.birth_date,
+          father_id=excluded.father_id,
+          mother_id=excluded.mother_id,
+          cage_id=excluded.cage_id,
+          status=excluded.status,
+          notes=excluded.notes
+        """,
+        (bird_id, ring_number, gender, breed, mutation, birth_date, father_id, mother_id, cage_id, status, notes),
+    )
+    return f"تم إضافة/تحديث الطائر '{bird_id}' بنجاح (القفص: '{cage_id}')."
 
-def log_clutch(cage_number: int, pair_male: str = "", pair_female: str = "", eggs_count: int = 0, fertile_count: int = 0, lay_date: str = "", incubation_start: str = "", notes: str = ""):
-    """تسجيل بطن بيض جديد مع حساب تاريخ الفقس المتوقع (13-14 يوم)."""
-    expected_hatch = ""
-    if incubation_start:
+def log_clutch(
+    cage_id: str,
+    male_id: str = "",
+    female_id: str = "",
+    egg_count: int = 0,
+    fertile_count: int = 0,
+    lay_date: str = "",
+    incubation_start_date: str = "",
+    hatch_days: int = 13,
+    hatched_count: int = 0,
+    notes: str = "",
+) -> str:
+    """تسجيل بطنة بيض جديدة واحتساب تاريخ الفقس المتوقع بناءً على بداية الحضانة."""
+    expected_db = ""
+    if incubation_start_date:
         try:
-            start = datetime.strptime(incubation_start, "%Y-%m-%d")
-            expected = start + timedelta(days=13)
-            expected_hatch = expected.strftime("%Y-%m-%d")
+            start_dt = datetime.strptime(incubation_start_date, "%Y-%m-%d")
+            expected_db = (start_dt + timedelta(days=hatch_days)).strftime("%Y-%m-%d")
         except Exception:
             pass
 
-    conn = sqlite3.connect("birds_room.db")
-    cursor = conn.cursor()
-    cursor.execute('''
-        INSERT INTO clutches (cage_number, pair_male, pair_female, eggs_count, fertile_count, lay_date, incubation_start, expected_hatch, notes)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-    ''', (cage_number, pair_male, pair_female, eggs_count, fertile_count, lay_date, incubation_start, expected_hatch, notes))
-    conn.commit()
-    conn.close()
-    return f"✅ تم تسجيل بطن البيض للقفص {cage_number}. تاريخ الفقس المتوقع: {expected_hatch or 'غير محدد'}."
+    db_execute(
+        """
+        INSERT INTO clutches (cage_id, male_id, female_id, egg_count, fertile_count, lay_date, incubation_start_date, expected_hatch_date, hatched_count, notes)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (cage_id, male_id, female_id, egg_count, fertile_count, lay_date, incubation_start_date, expected_db, hatched_count, notes),
+    )
+    return f"تم تسجيل البطنة للقفص '{cage_id}'. الفقس المتوقع: '{expected_db or 'غير محدد'}'."
 
-def log_health_record(bird_id: str, issue: str, treatment: str = "", date: str = "", notes: str = ""):
-    """تسجيل حالة صحية أو علاج لطائر."""
-    conn = sqlite3.connect("birds_room.db")
-    cursor = conn.cursor()
-    cursor.execute('''
-        INSERT INTO health_records (bird_id, date, issue, treatment, notes)
+def log_health(bird_id: str, issue: str, treatment: str = "", notes: str = "") -> str:
+    """تسجيل حالة صحية أو علاج لطائر معين."""
+    today = datetime.now().strftime("%Y-%m-%d")
+    db_execute(
+        """
+        INSERT INTO health_records (bird_id, record_date, issue, treatment, notes)
         VALUES (?, ?, ?, ?, ?)
-    ''', (bird_id, date or datetime.now().strftime("%Y-%m-%d"), issue, treatment, notes))
-    conn.commit()
-    conn.close()
-    return f"✅ تم تسجيل الحالة الصحية للطائر {bird_id}."
+        """,
+        (bird_id, today, issue, treatment, notes),
+    )
+    return f"تم تسجيل حالة صحية للطائر '{bird_id}' بتاريخ {today}."
 
-def get_room_summary():
-    """عرض تقرير شامل لغرفة الطيور."""
-    conn = sqlite3.connect("birds_room.db")
-    cursor = conn.cursor()
+def get_room_summary() -> str:
+    """جلب تقرير ملخص شامل عن غرفة الطيور والإنتاج."""
+    cages = db_execute("SELECT COUNT(*) FROM cages", fetch=True)[0][0]
+    birds = db_execute("SELECT COUNT(*) FROM birds", fetch=True)[0][0]
+    clutches_active = db_execute("SELECT COUNT(*) FROM clutches WHERE expected_hatch_date IS NOT NULL AND (hatched_count IS NULL OR hatched_count < egg_count)", fetch=True)[0][0]
+    health_total = db_execute("SELECT COUNT(*) FROM health_records", fetch=True)[0][0]
+
+    return (
+        f"📊 **ملخص غرفة الإنتاج:**\n"
+        f"- عدد الأقفاص: {cages}\n"
+        f"- إجمالي الطيور: {birds}\n"
+        f"- البطنات القائمة تحت الحضانة: {clutches_active}\n"
+        f"- إجمالي السجلات الصحية: {health_total}\n"
+    )
+
+def get_upcoming_events(days_ahead: int = 7) -> str:
+    """عرض البطنات المتوقع فقسها خلال الأيام المقبلة."""
+    today = datetime.now().date()
+    end = today + timedelta(days=days_ahead)
+    rows = db_execute("SELECT clutch_id, cage_id, egg_count, expected_hatch_date FROM clutches WHERE expected_hatch_date IS NOT NULL", fetch=True)
     
-    cursor.execute("SELECT cage_number, location, notes FROM cages")
-    cages = cursor.fetchall()
-    
-    if not cages:
-        conn.close()
-        return "غرفة الطيور فارغة حالياً ولم يتم تسجيل أقفاص."
+    upcoming = []
+    for r in rows:
+        try:
+            e_date = datetime.strptime(r[3], "%Y-%m-%d").date()
+            if today <= e_date <= end:
+                upcoming.append(f"- بطنة #{r[0]} في القفص {r[1]} (بيض: {r[2]}) -> فقس متوقع: {r[3]}")
+        except Exception:
+            continue
 
-    report = "📊 **تقرير غرفة الطيور الشامل:**\n\n"
-    for cage in cages:
-        c_num = cage[0]
-        report += f"🏠 **القفص {c_num}** ({cage[1] or 'بدون موقع'})\n"
-        
-        cursor.execute("SELECT bird_id, gender, strain, mutation FROM birds WHERE cage_number = ?", (c_num,))
-        birds = cursor.fetchall()
-        if birds:
-            for b in birds:
-                report += f"   • طائر {b[0]} | الجنس: {b[1] or '-'} | السلالة: {b[2] or '-'} | الطفرة: {b[3] or '-'}\n"
-        
-        cursor.execute("SELECT eggs_count, fertile_count, expected_hatch FROM clutches WHERE cage_number = ? ORDER BY id DESC LIMIT 1", (c_num,))
-        clutch = cursor.fetchone()
-        if clutch:
-            report += f"   🐣 *بطن قائم:* {clutch[0]} بيضات (مخصب: {clutch[1]}) | فقس متوقع: {clutch[2] or 'غير محدد'}\n"
-            
-        report += "---------------------\n"
+    if not upcoming:
+        return f"لا توجد أحداث فقس متوقعة خلال الـ {days_ahead} أيام القادمة."
+    return f"🐣 **الأحداث القادمة خلال {days_ahead} أيام:**\n" + "\n".join(upcoming)
 
-    conn.close()
-    return report
-
-# ------------------- إعداد الموديل والشخصية -------------------
-SYSTEM_INSTRUCTION = """
-أنت خبير ومساعد محترف في إدارة غرفة الطيور وتتبع السلالات والطفرات والجينات (مثل الكناري الموزاييك، الأجات، والتوباز، والفينش).
-تتحدث بمرونة وذكاء كزميل خبير.
-
-استخدم الأدوات المتاحة (Tools) فوراً للقيام بالعمليات على قاعدة البيانات بناءً على طلبات المربي.
+# --------------------------
+# تهيئة نموذج Gemini
+# --------------------------
+SYSTEM_PROMPT = """
+أنت خبير ومستشار محترف في تربية الكناري وطفراته (مثل الموزاييك، الأجات، والتوباز)، وعلم الجينات، والحضانة، والتغذية، والعلاج.
+تتحدث بأسلوب ودود وخبير، وتستخدم الأدوات المتاحة تلقائياً لتسجيل واسترجاع بيانات غرفة الإنتاج في قاعدة البيانات.
 """
 
 model = genai.GenerativeModel(
     model_name='gemini-2.0-flash',
-    system_instruction=SYSTEM_INSTRUCTION,
-    tools=[save_cage, add_bird, log_clutch, log_health_record, get_room_summary]
+    system_instruction=SYSTEM_PROMPT,
+    tools=[save_cage, add_bird, log_clutch, log_health, get_room_summary, get_upcoming_events]
 )
 
-user_sessions = {}
+# --------------------------
+# معالجات تلغرام
+# --------------------------
+async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("مرحباً بك في Canary Assistant Bot! 🐦✨\nأنا جاهز لمساعدتك في إدارة الأقفاص، الحجل، السلالات، ومواعيد الفقس.")
 
-# ------------------- معالجات تلغرام -------------------
-async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("يا مرحباً بك في نظام إدارة غرفة الطيور المطور! 🐦✨\nأنا جاهز لتسجيل الأقفاص، حجل الطيور، السلالات، والحالات الصحية.")
+async def report_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(get_room_summary())
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def upcoming_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(get_upcoming_events(7))
+
+async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    user_text = update.message.text
+    user_text = update.message.text or ""
 
     if user_id not in user_sessions:
         user_sessions[user_id] = model.start_chat(enable_automatic_function_calling=True)
-    
+
     chat = user_sessions[user_id]
 
     try:
@@ -229,10 +268,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if response.text:
             await update.message.reply_text(response.text)
         else:
-            await update.message.reply_text("تمت العملية بنجاح.")
-
+            await update.message.reply_text("تم تنفيذ الطلب بنجاح.")
     except Exception as e:
-        logging.error(f"Error handling message: {e}")
         user_sessions[user_id] = model.start_chat(enable_automatic_function_calling=True)
         try:
             response = await asyncio.to_thread(user_sessions[user_id].send_message, user_text)
@@ -240,13 +277,33 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception as err:
             await update.message.reply_text(f"⚠️ حدث خطأ أثناء المعالجة: {str(err)}")
 
-if __name__ == '__main__':
-    t = threading.Thread(target=run_flask, daemon=True)
-    t.start()
+# --------------------------
+# Flask Web Server (Render Health Check)
+# --------------------------
+app = Flask(__name__)
 
-    app_tg = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-    app_tg.add_handler(CommandHandler("start", start_command))
-    app_tg.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    
-    print("البوت يعمل بنجاح...")
-    app_tg.run_polling()
+@app.route("/", methods=["GET"])
+def index():
+    return "Canary Assistant Bot is Active!", 200
+
+def run_flask():
+    app.run(host="0.0.0.0", port=PORT)
+
+# --------------------------
+# التشغيل الرئيسي
+# --------------------------
+if __name__ == "__main__":
+    init_db()
+
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+
+    application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+
+    application.add_handler(CommandHandler("start", start_handler))
+    application.add_handler(CommandHandler("report", report_handler))
+    application.add_handler(CommandHandler("upcoming", upcoming_handler))
+    application.add_handler(MessageHandler(filters.TEXT & (~filters.COMMAND), text_handler))
+
+    print("تشغيل Canary Assistant Bot...")
+    application.run_polling(drop_pending_updates=True)
